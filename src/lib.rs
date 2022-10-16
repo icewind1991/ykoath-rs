@@ -1,35 +1,15 @@
 //! https://developers.yubico.com/OATH/YKOATH_Protocol.html
 
-pub use pcsc;
-use pcsc::{Card, Context, Protocols, Scope, ShareMode, MAX_BUFFER_SIZE};
-use std::iter;
+pub mod calculate;
+pub mod calculate_all;
+mod error;
+pub mod select;
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error(transparent)]
-    Pcsc(#[from] pcsc::Error),
-    #[error("No YubiKey found")]
-    NoDevice,
-    #[error("Response does not have enough length")]
-    InsufficientData,
-    #[error("Unknown response code (0x{0:04x})")]
-    UnknownCode(u16),
-    #[error("Unexpected value (0x{0:02x}")]
-    UnexpectedValue(u8),
-    #[error("No space")]
-    NoSpace,
-    #[error("No such object")]
-    NoSuchObject,
-    #[error("Auth required")]
-    AuthRequired,
-    #[error("Wrong syntax")]
-    WrongSyntax,
-    #[error("Generic error")]
-    GenericError,
-}
+pub use error::Error;
+use pcsc::{Card, Context, Protocols, Scope, ShareMode, MAX_BUFFER_SIZE};
+use std::fmt::{self, Write};
 
 pub struct YubiKey(Card);
-
 impl YubiKey {
     #[tracing::instrument(skip_all)]
     pub fn connect(buf: &mut Vec<u8>) -> Result<Self, Error> {
@@ -123,114 +103,8 @@ impl YubiKey {
             Err(Error::UnexpectedValue(tag))
         }
     }
-
-    // SELECT INSTRUCTION
-    #[tracing::instrument(skip(self, buf))]
-    pub fn select<'a>(&self, buf: &'a mut Vec<u8>) -> Result<select::Response<'a>, Error> {
-        buf.clear();
-        buf.extend_from_slice(&[0x00, 0xa4, 0x04, 0x00]);
-        buf.push(0x00);
-        buf.extend_from_slice(&[0xa0, 0x00, 0x00, 0x05, 0x27, 0x21, 0x01]);
-        let mut response = self.transmit(buf)?;
-        let (_, version) = Self::pop(&mut response, &[0x79])?;
-        let (_, name) = Self::pop(&mut response, &[0x71])?;
-        let inner = if response.is_empty() {
-            None
-        } else {
-            let (_, challenge) = Self::pop(&mut response, &[0x74])?;
-            let (_, algorithm) = Self::pop(&mut response, &[0x7b])?;
-            let algorithm = match algorithm {
-                [0x01] => Ok(Algorithm::HmacSha1),
-                [0x02] => Ok(Algorithm::HmacSha256),
-                [0x03] => Ok(Algorithm::HmacSha512),
-                [v] => Err(Error::UnexpectedValue(*v)),
-                _ => Err(Error::UnexpectedValue(algorithm.len() as _)),
-            }?;
-            Some(select::Inner {
-                challenge,
-                algorithm,
-            })
-        };
-        let response = select::Response {
-            version,
-            name,
-            inner,
-        };
-        tracing::debug!(response = ?response);
-        Ok(response)
-    }
-
-    // CALCULATE INSTRUCTION
-    #[tracing::instrument(skip(self, buf))]
-    pub fn calculate<'a>(
-        &self,
-        truncate: bool,
-        name: &[u8],
-        challenge: &[u8],
-        buf: &'a mut Vec<u8>,
-    ) -> Result<calculate::Response<'a>, Error> {
-        buf.clear();
-        buf.extend_from_slice(&[0x00, 0xa2, 0x00, if truncate { 0x01 } else { 0x00 }]);
-        buf.push(0x00);
-        Self::push(buf, 0x71, name);
-        Self::push(buf, 0x74, challenge);
-        let mut response = self.transmit(buf)?;
-        let (_, response) = Self::pop(&mut response, &[if truncate { 0x76 } else { 0x75 }])?;
-        let response = calculate::Response {
-            digits: *response.first().ok_or(Error::InsufficientData)?,
-            response: &response[1..],
-        };
-        tracing::debug!(response = ?response);
-        Ok(response)
-    }
-
-    // CALCULATE ALL INSTRUCTION
-    #[tracing::instrument(skip(self, buf))]
-    pub fn calculate_all<'a>(
-        &self,
-        truncate: bool,
-        challenge: &[u8],
-        buf: &'a mut Vec<u8>,
-    ) -> Result<impl Iterator<Item = Result<calculate_all::Response<'a>, Error>> + 'a, Error> {
-        let span = tracing::Span::current();
-        buf.clear();
-        buf.extend_from_slice(&[0x00, 0xa4, 0x00, if truncate { 0x01 } else { 0x00 }]);
-        buf.push(0x00);
-        Self::push(buf, 0x74, challenge);
-        let mut response = self.transmit(buf)?;
-        Ok(iter::from_fn(move || {
-            let _enter = span.enter();
-            if response.is_empty() {
-                None
-            } else {
-                Some(Self::pop(&mut response, &[0x71]).and_then(|(_, name)| {
-                    let (tag, response) = Self::pop(
-                        &mut response,
-                        &[if truncate { 0x76 } else { 0x75 }, 0x77, 0x7c],
-                    )?;
-                    let inner = match tag {
-                        0x75 | 0x76 => {
-                            let digits = *response.first().ok_or(Error::InsufficientData)?;
-                            let response = &response[1..];
-                            Ok(calculate_all::Inner::Response(calculate::Response {
-                                digits,
-                                response,
-                            }))
-                        }
-                        0x77 => Ok(calculate_all::Inner::Hotp),
-                        0x7c => Ok(calculate_all::Inner::Touch),
-                        _ => Err(Error::UnexpectedValue(tag)),
-                    }?;
-                    let response = calculate_all::Response { name, inner };
-                    tracing::debug!(response = ?response);
-                    Ok(response)
-                }))
-            }
-        }))
-    }
 }
 
-// ALGORITHMS
 #[derive(Debug)]
 pub enum Algorithm {
     HmacSha1,
@@ -238,40 +112,13 @@ pub enum Algorithm {
     HmacSha512,
 }
 
-pub mod select {
-    #[derive(Debug)]
-    pub struct Response<'a> {
-        pub version: &'a [u8],
-        pub name: &'a [u8],
-        pub inner: Option<Inner<'a>>,
-    }
-
-    #[derive(Debug)]
-    pub struct Inner<'a> {
-        pub challenge: &'a [u8],
-        pub algorithm: super::Algorithm,
-    }
-}
-
-pub mod calculate {
-    #[derive(Debug)]
-    pub struct Response<'a> {
-        pub digits: u8,
-        pub response: &'a [u8],
-    }
-}
-
-pub mod calculate_all {
-    #[derive(Debug)]
-    pub struct Response<'a> {
-        pub name: &'a [u8],
-        pub inner: Inner<'a>,
-    }
-
-    #[derive(Debug)]
-    pub enum Inner<'a> {
-        Response(super::calculate::Response<'a>),
-        Hotp,
-        Touch,
+struct EscapeAscii<'a>(&'a [u8]);
+impl fmt::Debug for EscapeAscii<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("b\"")?;
+        for b in self.0.escape_ascii() {
+            f.write_char(b as char)?;
+        }
+        f.write_char('"')
     }
 }
