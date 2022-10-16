@@ -31,43 +31,58 @@ pub enum Error {
 pub struct YubiKey(Card);
 
 impl YubiKey {
+    #[tracing::instrument(skip_all)]
     pub fn connect(buf: &mut Vec<u8>) -> Result<Self, Error> {
         let context = Context::establish(Scope::User)?;
         Self::connect_with(&context, buf)
     }
 
+    #[tracing::instrument(skip_all)]
     pub fn connect_with(context: &Context, buf: &mut Vec<u8>) -> Result<Self, Error> {
+        // https://github.com/Yubico/yubikey-manager/blob/4.0.9/ykman/pcsc/__init__.py#L46
+        const READER_NAME: &[u8] = b"yubico yubikey";
+
         buf.resize(context.list_readers_len()?, 0);
-        let reader = context
+        let reader_name = context
             .list_readers(buf)?
-            .find(|reader| reader.to_bytes().starts_with(b"Yubico YubiKey"))
+            .find(|reader_name| {
+                // https://github.com/Yubico/yubikey-manager/blob/21d351303647fc82d7a999a687f019749cbda80b/ykman/pcsc/__init__.py#L165
+                reader_name
+                    .to_bytes()
+                    .to_ascii_lowercase()
+                    .windows(READER_NAME.len())
+                    .any(|window| window == READER_NAME)
+            })
             .ok_or(Error::NoDevice)?;
+        tracing::debug!(reader_name = ?reader_name);
         Ok(Self(context.connect(
-            reader,
-            ShareMode::Exclusive,
+            reader_name,
+            ShareMode::Shared,
             Protocols::ANY,
         )?))
     }
 
+    #[tracing::instrument(skip_all)]
     fn transmit<'a>(&self, buf: &'a mut Vec<u8>) -> Result<&'a [u8], Error> {
         if buf.len() >= 5 {
             // Lc
             buf[4] = (buf.len() - 5) as _;
         }
+        tracing::trace!(command = ?buf);
         let mid = buf.len();
         loop {
             let len = buf.len();
             buf.resize(len + MAX_BUFFER_SIZE, 0);
             let (occupied, vacant) = buf.split_at_mut(len);
-            let response = self.0.transmit(
-                if mid == len {
-                    &occupied[..mid]
-                } else {
-                    // SEND REMAINING INSTRUCTION
-                    &[0x00, 0xa5, 0x00, 0x00]
-                },
-                vacant,
-            )?;
+            let command = if mid == len {
+                &occupied[..mid]
+            } else {
+                // SEND REMAINING INSTRUCTION
+                &[0x00, 0xa5, 0x00, 0x00]
+            };
+            tracing::trace!(pcsc_command = ?command);
+            let response = self.0.transmit(command, vacant)?;
+            tracing::trace!(pcsc_response = ?response);
             let len = len + response.len();
             buf.truncate(len);
             let code = u16::from_le_bytes([
@@ -75,7 +90,11 @@ impl YubiKey {
                 buf.pop().ok_or(Error::InsufficientData)?,
             ]);
             match code {
-                0x9000 => break Ok(&buf[mid..]),
+                0x9000 => {
+                    let response = &buf[mid..];
+                    tracing::trace!(response = ?response);
+                    break Ok(response);
+                }
                 0x6100..=0x61ff => Ok(()),
                 0x6a84 => Err(Error::NoSpace),
                 0x6984 => Err(Error::NoSuchObject),
@@ -106,6 +125,7 @@ impl YubiKey {
     }
 
     // SELECT INSTRUCTION
+    #[tracing::instrument(skip(self, buf))]
     pub fn select<'a>(&self, buf: &'a mut Vec<u8>) -> Result<select::Response<'a>, Error> {
         buf.clear();
         buf.extend_from_slice(&[0x00, 0xa4, 0x04, 0x00]);
@@ -134,14 +154,17 @@ impl YubiKey {
                 algorithm,
             })
         };
-        Ok(select::Response {
+        let response = select::Response {
             version,
             name,
             inner,
-        })
+        };
+        tracing::debug!(response = ?response);
+        Ok(response)
     }
 
     // CALCULATE INSTRUCTION
+    #[tracing::instrument(skip(self, buf))]
     pub fn calculate<'a>(
         &self,
         truncate: bool,
@@ -156,24 +179,30 @@ impl YubiKey {
         Self::push(buf, 0x74, challenge);
         let mut response = self.transmit(buf)?;
         let (_, response) = Self::pop(&mut response, &[if truncate { 0x76 } else { 0x75 }])?;
-        let digits = *response.first().ok_or(Error::InsufficientData)?;
-        let response = &response[1..];
-        Ok(calculate::Response { digits, response })
+        let response = calculate::Response {
+            digits: *response.first().ok_or(Error::InsufficientData)?,
+            response: &response[1..],
+        };
+        tracing::debug!(response = ?response);
+        Ok(response)
     }
 
     // CALCULATE ALL INSTRUCTION
+    #[tracing::instrument(skip(self, buf))]
     pub fn calculate_all<'a>(
         &self,
         truncate: bool,
         challenge: &[u8],
         buf: &'a mut Vec<u8>,
     ) -> Result<impl Iterator<Item = Result<calculate_all::Response<'a>, Error>> + 'a, Error> {
+        let span = tracing::Span::current();
         buf.clear();
         buf.extend_from_slice(&[0x00, 0xa4, 0x00, if truncate { 0x01 } else { 0x00 }]);
         buf.push(0x00);
         Self::push(buf, 0x74, challenge);
         let mut response = self.transmit(buf)?;
         Ok(iter::from_fn(move || {
+            let _enter = span.enter();
             if response.is_empty() {
                 None
             } else {
@@ -195,7 +224,9 @@ impl YubiKey {
                         0x7c => Ok(calculate_all::Inner::Touch),
                         _ => Err(Error::UnexpectedValue(tag)),
                     }?;
-                    Ok(calculate_all::Response { name, inner })
+                    let response = calculate_all::Response { name, inner };
+                    tracing::debug!(response = ?response);
+                    Ok(response)
                 }))
             }
         }))
