@@ -139,15 +139,12 @@ impl YubiKey {
         } else {
             let (_, challenge) = Self::pop(&mut response, &[0x74])?;
             let (_, algorithm) = Self::pop(&mut response, &[0x7b])?;
-            let algorithm = if algorithm.len() == 1 {
-                match algorithm[0] {
-                    0x01 => Ok(Algorithm::HmacSha1),
-                    0x02 => Ok(Algorithm::HmacSha256),
-                    0x03 => Ok(Algorithm::HmacSha512),
-                    _ => Err(Error::UnexpectedValue(algorithm[0])),
-                }
-            } else {
-                Err(Error::UnexpectedValue(algorithm.len() as _))
+            let algorithm = match algorithm {
+                [0x01] => Ok(Algorithm::HmacSha1),
+                [0x02] => Ok(Algorithm::HmacSha256),
+                [0x03] => Ok(Algorithm::HmacSha512),
+                [v] => Err(Error::UnexpectedValue(*v)),
+                _ => Err(Error::UnexpectedValue(algorithm.len() as _)),
             }?;
             Some(select::Inner {
                 challenge,
