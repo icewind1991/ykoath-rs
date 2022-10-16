@@ -46,7 +46,7 @@ impl YubiKey {
         let reader_name = context
             .list_readers(buf)?
             .find(|reader_name| {
-                // https://github.com/Yubico/yubikey-manager/blob/21d351303647fc82d7a999a687f019749cbda80b/ykman/pcsc/__init__.py#L165
+                // https://github.com/Yubico/yubikey-manager/blob/4.0.9/ykman/pcsc/__init__.py#L165
                 reader_name
                     .to_bytes()
                     .to_ascii_lowercase()
