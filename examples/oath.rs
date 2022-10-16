@@ -33,7 +33,7 @@ fn main() -> anyhow::Result<()> {
                 true
             }
         })
-        .ok_or_else(|| anyhow::format_err!("missing account for {}", opts.name))??;
+        .ok_or_else(|| anyhow::format_err!("no account: {}", opts.name))??;
 
     let calculate::Response { digits, response } = match response.inner {
         calculate_all::Inner::Response(response) => response,
