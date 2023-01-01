@@ -5,11 +5,15 @@ pub mod calculate_all;
 mod error;
 pub mod select;
 
+pub use crate::calculate::Response;
+pub use crate::calculate_all::{BulkResponse, BulkResponseData};
 pub use error::Error;
 use pcsc::{Card, Context, Protocols, Scope, ShareMode, MAX_BUFFER_SIZE};
-use std::fmt::{self, Write};
+use std::fmt::{self, Debug, Write};
+use std::mem::size_of;
 
 pub struct YubiKey(Card);
+
 impl YubiKey {
     #[tracing::instrument(skip_all)]
     pub fn connect(buf: &mut Vec<u8>) -> Result<Self, Error> {
@@ -86,10 +90,10 @@ impl YubiKey {
         }
     }
 
-    fn push(buf: &mut Vec<u8>, tag: u8, data: &[u8]) {
+    fn push<Data: Payload>(buf: &mut Vec<u8>, tag: u8, data: Data) {
         buf.push(tag);
-        buf.push(data.len() as _);
-        buf.extend_from_slice(data);
+        buf.push(data.len());
+        data.push_into(buf);
     }
 
     fn pop<'a>(buf: &mut &'a [u8], tags: &[u8]) -> Result<(u8, &'a [u8]), Error> {
@@ -113,6 +117,7 @@ pub enum Algorithm {
 }
 
 struct EscapeAscii<'a>(&'a [u8]);
+
 impl fmt::Debug for EscapeAscii<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("b\"")?;
@@ -120,5 +125,30 @@ impl fmt::Debug for EscapeAscii<'_> {
             f.write_char(b as char)?;
         }
         f.write_char('"')
+    }
+}
+
+pub trait Payload: Debug {
+    fn push_into(&self, buf: &mut Vec<u8>);
+    fn len(&self) -> u8;
+}
+
+impl Payload for &'_ [u8] {
+    fn push_into(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(self)
+    }
+
+    fn len(&self) -> u8 {
+        <[u8]>::len(self) as _
+    }
+}
+
+impl Payload for i64 {
+    fn push_into(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.to_be_bytes())
+    }
+
+    fn len(&self) -> u8 {
+        size_of::<Self>() as _
     }
 }

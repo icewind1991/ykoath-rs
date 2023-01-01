@@ -1,7 +1,6 @@
 use chrono::offset::Utc;
 use clap::Parser;
-use ykoath::calculate;
-use ykoath::calculate_all;
+use ykoath::BulkResponseData;
 use ykoath::YubiKey;
 
 #[derive(Parser)]
@@ -21,35 +20,31 @@ fn main() -> anyhow::Result<()> {
 
     // https://github.com/Yubico/yubikey-manager/blob/4.0.9/yubikit/oath.py#L57
     // https://github.com/Yubico/yubikey-manager/blob/4.0.9/yubikit/oath.py#L225-L226
-    let challenge = (Utc::now().timestamp() / 30).to_be_bytes();
+    let challenge = Utc::now().timestamp() / 30;
 
     // https://github.com/Yubico/yubikey-manager/blob/4.0.9/yubikit/oath.py#L391-L393
     let response = yubikey
-        .calculate_all(true, &challenge, &mut buf)?
+        .calculate_all(true, challenge, &mut buf)?
         .find(|response| {
             if let Ok(response) = response {
-                response.name == opts.name.as_bytes()
+                response.name == opts.name
             } else {
                 true
             }
         })
         .ok_or_else(|| anyhow::format_err!("no account: {}", opts.name))??;
 
-    let calculate::Response { digits, response } = match response.inner {
-        calculate_all::Inner::Response(response) => response,
-        calculate_all::Inner::Hotp => anyhow::bail!("HOTP is not supported"),
-        calculate_all::Inner::Touch => {
+    let response = match response.data {
+        BulkResponseData::Totp(response) => response,
+        BulkResponseData::Hotp => anyhow::bail!("HOTP is not supported"),
+        BulkResponseData::Touch => {
             eprintln!("Touch YubiKey ...");
-            yubikey.calculate(true, opts.name.as_bytes(), &challenge, &mut buf)?
+            yubikey.calculate(true, opts.name.as_bytes(), challenge, &mut buf)?
         }
     };
 
     // https://github.com/Yubico/yubikey-manager/blob/4.0.9/yubikit/oath.py#L240
-    println!(
-        "{:01$}",
-        u32::from_be_bytes(response.try_into()?) % 10_u32.pow(u32::from(digits)),
-        digits as _,
-    );
+    println!("{}", response);
 
     Ok(())
 }

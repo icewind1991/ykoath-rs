@@ -1,3 +1,5 @@
+use std::str::Utf8Error;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -20,4 +22,6 @@ pub enum Error {
     WrongSyntax,
     #[error("Generic error")]
     GenericError,
+    #[error("Non utf8 key name")]
+    Utf8(#[from] Utf8Error),
 }
